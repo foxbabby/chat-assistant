@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+dist/
+artifacts/
+.codex/
+.env
+.env.*
+*.log
+settings.json
+learned-profile.json
+learning-cursor.json
+processed.json
