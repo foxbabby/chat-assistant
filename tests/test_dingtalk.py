@@ -51,6 +51,19 @@ class DingTalkTests(unittest.TestCase):
         self.rows=[row('latest',sender='other'),row('before',sender='self-open')]
         result=self.adapter.read()
         self.assertEqual([m.side for m in result['messages']],['me','them'])
+    def test_two_stage_reply_quotes_original_with_distinct_idempotency(self):
+        self.cfg.save({'spd_knowledge':'enabled'})
+        e=self.engine()
+        def generate(*args):return '查到的规则。'
+        generate.supports_research_ack=True
+        e.generator=generate
+        e.start();self.rows.insert(0,row('question','需求计划有哪些类型'))
+        e.tick()
+        self.assertEqual(len(self.writes),2)
+        self.assertEqual([w[w.index('--message-id')+1] for w in self.writes],['question','question'])
+        keys=[w[w.index('--idempotency-key')+1] for w in self.writes]
+        self.assertNotEqual(keys[0],keys[1])
+        e.tick();self.assertEqual(len(self.writes),2)
     def test_identical_messages_have_distinct_ids(self):
         first=self.adapter.read();self.rows=[row('new'),row('old')]
         self.assertNotEqual(digest(first),digest(self.adapter.read()))

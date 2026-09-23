@@ -228,11 +228,6 @@ class Engine:
                     self.show_snapshot(snap, '本助手发送记录已匹配，跳过重复回复')
                     self.status = '已跳过本助手发送的内容，继续等待新消息'
                     return
-                if messages and getattr(messages[-1], 'kind', 'text') not in ('text','sticker','image'):
-                    self.baseline = sig
-                    self.show_snapshot(snap, '非文字消息，仅显示，不自动回复')
-                    self.status = '最新消息是图片、表情或其他非文字内容，继续等待文字消息'
-                    return
                 if (messages and getattr(messages[-1], 'kind', 'text') in ('image','sticker')
                         and 'image-pending:'+self.outgoing_key(snap,'') in self.outbox):
                     self.baseline = sig
@@ -270,6 +265,10 @@ class Engine:
                 self.baseline = sig
                 if key in self.processed:
                     return
+                if 'research:'+key in self.processed:
+                    self.show_snapshot(snap, '这条问题曾发送查询提示，但未确认最终回复；请人工核对，避免重复发送')
+                    self.status = '上次查询未完成，请核对；继续监听新消息'
+                    return
                 if messages[-1].conf < 0.85:
                     self.show_snapshot(snap, '消息识别不够清晰，已跳过；继续监听')
                     self.status = '已跳过识别不清晰的消息，继续等待新消息'
@@ -278,16 +277,59 @@ class Engine:
                 self.status = '正在生成' + config['style'] + '回复…'
                 self.latest = {'incoming': messages[-1].text, 'reply': '', 'state': '生成中'}
             history = copy.deepcopy(messages)
-            if hasattr(self.adapter, 'prepare_history'):
-                history = self.adapter.prepare_history(snap, config, history)
+            question_snapshot = snap
             for message in history:
                 if self.sent_by_assistant(snap, message.text):
                     message.side = 'me'
-            if getattr(messages[-1], 'kind', 'text') in ('sticker','image') and not getattr(self.adapter, 'text_media_reply', False):
-                from stickers import reply_card
-                answer = reply_card(config, messages[-1].text)
-            else:
-                answer = self.generator(config, history)
+            from cloud import Draft, work_clarification
+            from cloud import work_query
+            acknowledged = False
+            # Only the production knowledge generator opts in; previews do not send.
+            if (getattr(self.generator, 'supports_research_ack', False) is True
+                    and work_query(history)[1] and config.get('spd_knowledge') == 'enabled'):
+                acknowledgement = '我查一下相关资料，稍等。'
+                original = copy.deepcopy(messages[-1])
+                with self.lock:
+                    if epoch != self.epoch or not self.enabled:
+                        return
+                    self.reserve_outgoing(snap, acknowledgement)
+                    self.processed.add('research:'+key)
+                    atomic_json(self.ledger_path, sorted(self.processed))
+                    self.status = '正在发送查询提示…'
+                snap = self.adapter.send(acknowledgement, snap, lambda: self.enabled and self.epoch == epoch)
+                acknowledged = True
+                # Second DingTalk reply quotes the original question, not our own ack.
+                snap['reply_anchor'] = original
+                snap['reply_phase'] = 'answer'
+                with self.lock:
+                    if epoch != self.epoch or not self.enabled:
+                        return
+                    self.baseline = signature(snap)
+                    self.latest['state'] = '已告知稍等，正在查资料'
+                    self.status = '已告知稍等，正在查询 SPD 资料…'
+                    self.event('已发送查询提示，正在查资料')
+            try:
+                if hasattr(self.adapter, 'prepare_history'):
+                    history = self.adapter.prepare_history(question_snapshot, config, history)
+                kind = getattr(messages[-1], 'kind', 'text')
+                if kind not in ('text', 'sticker', 'image'):
+                    answer = Draft('收到了，方便用文字补充一下你想说的内容吗？')
+                elif kind in ('sticker','image') and not getattr(self.adapter, 'text_media_reply', False):
+                    from stickers import reply_card
+                    answer = reply_card(config, messages[-1].text)
+                else:
+                    answer = self.generator(config, history)
+            except CloudError as error:
+                if not isinstance(error, NeedsReview) and not acknowledged:
+                    raise
+                # A content uncertainty is not a reason to ignore an incoming message.
+                # Use a factual clarification, never the rejected model's answer.
+                if getattr(messages[-1], 'has_resources', False) or getattr(messages[-1], 'kind', 'text') in ('image', 'sticker'):
+                    answer = Draft('图片收到了，方便用文字补充一下重点吗？', warnings=['图片未能可靠识别，本次仅追问内容'])
+                else:
+                    answer = work_clarification(messages[-1].text) or Draft('这点我还不确定，方便再具体说一下吗？', warnings=['本次发送澄清追问，未采用未经确认的答案'])
+                if acknowledged and not isinstance(error, NeedsReview):
+                    answer = Draft('这次查询暂时没完成，还不能给你准确结论。方便补充一下具体页面或现场版本吗？', warnings=['资料查询或模型服务失败，本次发送进度说明'])
             with self.lock:
                 if epoch != self.epoch or not self.enabled:
                     return

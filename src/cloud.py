@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -20,7 +21,7 @@ def completion(config, messages, *, probe=False):
         raise CloudError('请先在设置中填写 API Key')
     base = config['base_url'].rstrip('/')
     url = base if base.endswith('/chat/completions') else base + '/chat/completions'
-    payload = {'model': config['model'], 'messages': messages, 'max_tokens': 300 if not probe else 16,
+    payload = {'model': config['model'], 'messages': messages, 'max_tokens': (1000 if config.get('_work_answer') else 300) if not probe else 16,
                'stream': False}
     if urlparse(url).hostname == 'api.deepseek.com':
         payload['thinking'] = {'type': 'disabled'}
@@ -33,7 +34,7 @@ def completion(config, messages, *, probe=False):
         if not isinstance(text, str) or not text.strip():
             raise CloudError('模型返回了空回复，请检查模型名称或稍后重试')
         text = text.strip()
-        if len(text) > 600:
+        if len(text) > (2200 if config.get('_work_answer') else 600):
             raise CloudError('回复过长，已取消自动发送')
         return text
     except urllib.error.HTTPError as e:
@@ -60,8 +61,62 @@ class Draft(str):
         return obj
 
 
+def work_query(messages):
+    """Only inherit a work topic for an explicit follow-up to that topic."""
+    from knowledge import TERMS
+    if not messages:
+        return '', False
+    latest = messages[-1].text.strip()
+    has_topic = lambda text: any(term.lower() in text.lower() for term in TERMS)
+    if has_topic(latest):
+        return latest, True
+    # A new location/social question must not inherit keywords from old messages.
+    follow_up = re.fullmatch(
+        r'(?:那|那么|所以|这个|那个|这|它|还是|现在|具体|又|仍然|还)?[，,\s]*'
+        r'(?:怎么(?:办|处理|解决|操作|查|改)|如何(?:处理|解决|操作|查)|为什么|'
+        r'什么原因|在哪(?:里)?(?:设置|修改|操作|查看)|报错了?|不行|不对|没解决|'
+        r'有问题|失败了?|不一致|怎么回事)[^。！？!?]{0,25}[。！？!?]*', latest)
+    if follow_up:
+        for message in reversed(messages[-3:-1]):
+            if has_topic(message.text):
+                return message.text + '\n' + latest, True
+    return latest, False
+
+
+def evidence_answer(raw, evidence, warnings):
+    # Accept the common JSON markdown wrapper, never arbitrary surrounding prose.
+    fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', raw.strip(), re.S | re.I)
+    try:
+        data = json.loads(fenced.group(1) if fenced else raw)
+        if not isinstance(data, dict):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise NeedsReview('模型回复格式异常，未发送；继续监听') from None
+    if data.get('supported') is False:
+        detail = '；' + '；'.join(warnings) if warnings else ''
+        raise NeedsReview('资料不足以支持本次答案' + detail + '；待人工确认，继续监听')
+    ids = data.get('evidence_ids', [])
+    valid_ids = {e['id'] for e in evidence}
+    if (data.get('supported') is not True or not isinstance(ids, list) or not ids
+            or any(not isinstance(i, str) or i not in valid_ids for i in ids)
+            or not isinstance(data.get('answer'), str) or not data['answer'].strip()):
+        raise NeedsReview('模型未提供有效的答案依据，未发送；继续监听')
+    return data['answer'].strip(), [e['source'] for e in evidence if e['id'] in ids]
+
+
+def work_clarification(question, warnings=()):
+    """Ask for missing observations, never turn an unsupported cause into a claim."""
+    if not re.search(r'查(?:询)?不(?:出来|到)|搜不到|报错|失败|异常|不一致|不对|不能|无法|怎么处理|怎么办', question):
+        return None
+    if re.search(r'耗材.*(?:查|搜)|(?:查|搜).*耗材', question):
+        text = '是所有耗材都查不到，还是某一个？把耗材编码和查询条件的截图发我看一下。'
+    else:
+        text = '具体在哪一步出现的？方便把操作页面和报错提示发我看一下吗？'
+    return Draft(text, (), ['尚未确认原因，本次仅追问排查信息', *warnings])
+
+
 def reply(config, messages):
-    from knowledge import retrieve, TERMS
+    from knowledge import retrieve
     from config import DATA_DIR
     # Updated independently by the learning task; manual settings remain authoritative.
     learned = {}
@@ -75,11 +130,14 @@ def reply(config, messages):
         pass
     config = config.copy()
     config['work_knowledge'] = config.get('work_knowledge', '') + '\n' + str(learned.get('knowledge', ''))[:10000]
-    question = '\n'.join(m.text for m in messages[-3:])
-    work_question = any(term in question for term in TERMS)
+    question, work_question = work_query(messages)
     evidence, warnings = retrieve(config, question)
     if work_question and not evidence:
-        raise NeedsReview('工作问题缺少可靠资料，待人工确认；继续监听')
+        clarification = work_clarification(question, warnings)
+        if clarification:
+            return clarification
+        detail = '；' + '；'.join(warnings) if warnings else ''
+        raise NeedsReview('未检索到相关工作资料' + detail + '；待人工确认，继续监听')
     system = ('你受用户委托代拟聊天回复，输出的就是用户本人要说的话。用第一人称，不自称机器人、AI、助手或客服。'
               '历史里自称机器人、没有生日、没有日历等内容是旧版本错误，不要延续这些设定。不能把软件工具限制说成用户本人的能力限制。'
               '不知道用户的生日、家庭或经历时，不能否认这些真实人的属性，也不能猜测日期或经历。'
@@ -96,31 +154,62 @@ def reply(config, messages):
               '\n用户确认的真实表达示例：' + config.get('reply_examples', ''))
     if evidence:
         system += '\n工作参考资料（只支持其明确覆盖的结论，本地源码不等于现场版本）：' + json.dumps(evidence, ensure_ascii=False)
+        rule_items = [e for e in evidence if e['text'].startswith('规则实现类：')]
+        if rule_items and any(word in question for word in ('哪些','规则','有哪些')):
+            system += ('\n本次已读取'+str(len(rule_items))+'个独立规则实现。答案必须逐项编号列出这些规则，'
+                       '不要合并“自定义分类”和“自定义明细字段”，不要遗漏开关控制的规则；'
+                       '按资料注明是否受配置控制，不声称现场全部启用。'
+                       '列完即结束，只可加一句版本配置说明；不要臆造另一条规则、易混淆规则或未读取的实现。')
     if work_question:
         system += ('\n请仅输出 JSON：{"answer":"可以直接发出的自然回复", "supported":true, "evidence_ids":["1"]}。'
                    'supported 只有资料能明确支持本次具体答案时才为 true，evidence_ids 列出实际支撑答案的资料编号。'
                    '匹配到相同关键词不代表相同问题；案例版本、前提不一致或证据有缺口时 supported=false，answer 留空。'
-                   '不要把源码路径、资料全文或排查系统内部细节写进 answer。')
+                   '不要把源码路径、资料全文或排查系统内部细节写进 answer。'
+                   '询问有哪些规则、支持哪些功能时，回答已提供实现支持的规则清单，不要因尚未核实现场配置就拒答；说明具体生效取决于配置和版本。'
+                   '源码可以支持排查方向，但不能证明现场故障原因；以“可以先核对”表述有依据的检查项，不断言现场原因。'
+                   '严格区分普通新建查询、导入、智能补货、紧急申领等入口，不能把某个入口的过滤条件说成所有入口的共同规则；入口不明确时先列普适检查并追问入口。'
+                   '规则枚举可以超过两句话，避免遗漏；答案最多600字。')
+        system += ('\n类型/状态问题优先核对实际常量声明，旧注释可能过时；'
+                   '不要把源码支持的值等同于现场下拉选项，未核实中文名称的值保留编码并说明。')
+        system += ('\n手册按标注版本适用，测试用例只证明预期行为，不能声称已经执行测试或现场已验证。'
+                   '资料版本冲突时明确说明差异并询问现场版本，不擅自把旧资料说成最新规则。'
+                   '未提供数据库查询结果就不能声称查过数据库；敏感业务数据及凭据不得转发。')
+        system += ('\n测试库表结构只能证明字段存在，不能据此断言业务规则、现场版本或当前故障原因。'
+                   '测试库按耗材编码查得的聚合状态也不能代表生产现场；回答时说明它是测试库结果。')
     else:
-        system += '只输出一条可以直接发送的回复。'
+        system += ('只输出一条可以直接发送的回复。只回应最后一条消息的当前话题；'
+                   '对方已转到吃饭、出行等新话题时，不继续回答前面的工作问题，'
+                   '不附带旧问题的原因猜测或处理承诺。')
+    history_messages = messages[-8:]
+    if not work_question:
+        from knowledge import TERMS
+        for index in range(len(history_messages)-2, -1, -1):
+            if any(term.lower() in history_messages[index].text.lower() for term in TERMS):
+                history_messages = history_messages[index+1:]
+                if len(history_messages) == 1 and re.fullmatch(r'[^，。！？!?\n]{1,12}还是[^，。！？!?\n]{1,12}[？?]?', history_messages[0].text.strip()):
+                    return Draft('你是指哪件事？我确认一下，免得理解错。')
+                system += ('\n当前已转入新话题，不能将旧工作问题套用到本条消息。'
+                           '缺少地点、安排或个人行为的事实时简短澄清，不能说自己已去过、看过、查过或决定了某处。')
+                break
     history = [{'role': 'assistant' if m.side == 'me' else 'user', 'content': m.text[:2000]}
-               for m in messages[-8:]]
+               for m in history_messages]
+    config['_work_answer'] = work_question
     answer = completion(config, [{'role': 'system', 'content': system}] + history)
     used = []
     if work_question:
         try:
-            data = json.loads(answer)
-            ids = data.get('evidence_ids', [])
-            valid_ids = {e['id'] for e in evidence}
-            if (data.get('supported') is not True or not isinstance(ids, list) or not ids
-                    or any(not isinstance(i, str) or i not in valid_ids for i in ids)
-                    or not isinstance(data.get('answer'), str) or not data['answer'].strip()):
-                raise ValueError()
-            answer = data['answer'].strip()
-            used = [e['source'] for e in evidence if e['id'] in ids]
-        except (ValueError, TypeError, AttributeError):
-            raise NeedsReview('现有资料不能确认这个问题，待人工确认；继续监听') from None
-    import re
+            answer, used = evidence_answer(answer, evidence, warnings)
+        except NeedsReview as error:
+            if str(error).startswith('资料不足以支持本次答案'):
+                clarification = work_clarification(question, warnings)
+                if clarification:
+                    return clarification
+            raise
     if re.search(r'(?:我是|作为|身为|就是)(?:一个|一名)?(?:AI|人工智能|机器人|语言模型|(?:微信)?聊天助手)', answer, re.I):
         raise NeedsReview('回复出现助手身份措辞，未发送；继续监听')
+    if len(answer) > 600:
+        raise NeedsReview('答案过长，改为澄清追问；继续监听')
     return Draft(answer, used, warnings)
+
+# Engine-only opt-in for a verified acknowledgement before a slow knowledge lookup.
+reply.supports_research_ack = True

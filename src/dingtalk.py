@@ -183,10 +183,12 @@ class DingTalk:
         fresh = self.read()
         if not allowed() or identity(fresh) != identity(expected) or signature(fresh) != signature(expected):
             raise ValueError('钉钉会话或消息已变化，本次未发送')
-        last = expected['messages'][-1]
+        last = expected.get('reply_anchor', expected['messages'][-1])
+        if expected.get('reply_anchor') and not any(m.message_id == last.message_id and m.sender_id == last.sender_id for m in expected['messages']):
+            raise ValueError('原问题已不在当前消息中，本次未发送')
         if last.side != 'them' or not last.sender_id:
             raise ValueError('最新消息无需回复，本次未发送')
-        key = hashlib.sha256((profile + '\0' + cid + '\0' + last.message_id).encode()).hexdigest()
+        key = hashlib.sha256((profile + '\0' + cid + '\0' + last.message_id + '\0' + expected.get('reply_phase', 'initial')).encode()).hexdigest()
         # A user enables replies to this exact target in the UI before this path is reachable.
         # Exactly one write; a timeout or unknown outcome must never trigger another send.
         data = run(['chat', '+messages-reply', '--group', cid, '--message-id', last.message_id,

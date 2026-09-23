@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 let nativeAccessGranted = false;
 let state = null, busy = false, toastTimer, platform = 'wechat', dingListProfile = null, historyChoice = {wechat:false,dingtalk:false}, historyLoaded = false;
+let dingSettingsConversations = [], dingMainConversations = [];
 async function api(path, data) {
   const response = await fetch('/api/' + path + (data === undefined ? '?platform='+platform : ''), data === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...data,platform})});
   const body = await response.json();
@@ -18,10 +19,9 @@ function render(next) {
   if(!historyLoaded){for(const p of ['wechat','dingtalk'])historyChoice[p]=state.settings[p+'_reply_latest'];historyLoaded=true;}
   $('reply-latest').checked=historyChoice[platform];$('reply-latest').disabled=busy||state.enabled||state.starting;
   $('main-ding-picker').hidden=platform!=='dingtalk';
-  if(dingListProfile!==state.settings.dingtalk_profile){dingListProfile=null;$('main-ding-conversation').replaceChildren();option($('main-ding-conversation'),'','请选择会话');}
-  if(state.settings.dingtalk_conversation&&!Array.from($('main-ding-conversation').options).some(o=>o.value===state.settings.dingtalk_conversation))option($('main-ding-conversation'),state.settings.dingtalk_conversation,state.settings.dingtalk_name);
-  $('main-ding-conversation').value=state.settings.dingtalk_conversation;
-  $('main-ding-conversation').disabled=busy;
+  if(dingListProfile!==state.settings.dingtalk_profile){dingListProfile=null;dingMainConversations=[];setConversation('main-ding',state.settings.dingtalk_conversation,state.settings.dingtalk_name);}
+  if(document.activeElement!==$('main-ding-input')&&$('main-ding-input').dataset.selectedId!==state.settings.dingtalk_conversation)setConversation('main-ding',state.settings.dingtalk_conversation,state.settings.dingtalk_name);
+  $('main-ding-input').disabled=busy;
   $('dot').classList.toggle('on',state.enabled);
   $('run-label').textContent=state.enabled?'正在自动回复':state.starting?'正在开启':'已暂停';
   $('headline').textContent=state.enabled?(state.target?`正在照看「${state.target}」`:'自动回复已开启，等待会话'):'让每一次回应，恰到好处。';
@@ -45,11 +45,11 @@ function render(next) {
   for(const event of state.events){const li=document.createElement('li'),time=document.createElement('time'),text=document.createElement('span');time.textContent=event.time;text.textContent=event.text;li.append(time,text);$('events').append(li);}
 }
 async function refresh(){try{if(!busy)render(await api('state'));}catch(error){$('status').textContent='助手服务未连接，请重新打开应用';$('toggle').disabled=true;}}
-function openSettings(){if(!state)return;$('ding-image-mode').value=state.settings.dingtalk_image_mode||'ocr';$('ding-vision-url').value=state.settings.dingtalk_vision_url||'';$('ding-vision-model').value=state.settings.dingtalk_vision_model||'';$('ding-vision-key').value='';$('ding-vision-key').placeholder=state.settings.has_vision_key?'已保存，留空保留原 Key':'填写视觉模型 API Key';$('base-url').value=state.settings.base_url;$('model').value=state.settings.model;$('api-key').value='';$('excluded-senders').value=state.settings.excluded_senders.join('\n');$('self-names').value=(state.settings.self_names||[]).join('\n');$('api-key').placeholder=state.settings.has_key?'已保存，留空保留原 Key':'填写你的 API Key';$('voice-profile').value=state.settings.voice_profile||'';$('reply-examples').value=state.settings.reply_examples||'';$('work-knowledge').value=state.settings.work_knowledge||'';$('spd-knowledge').value=state.settings.spd_knowledge||'enabled';$('settings-feedback').textContent='';fillDingSettings();$('settings').showModal();}
+function openSettings(){if(!state)return;$('ding-image-mode').value=state.settings.dingtalk_image_mode||'ocr';$('ding-vision-url').value=state.settings.dingtalk_vision_url||'';$('ding-vision-model').value=state.settings.dingtalk_vision_model||'';$('ding-vision-key').value='';$('ding-vision-key').placeholder=state.settings.has_vision_key?'已保存，留空保留原 Key':'填写视觉模型 API Key';$('base-url').value=state.settings.base_url;$('model').value=state.settings.model;$('api-key').value='';$('excluded-senders').value=state.settings.excluded_senders.join('\n');$('self-names').value=(state.settings.self_names||[]).join('\n');$('api-key').placeholder=state.settings.has_key?'已保存，留空保留原 Key':'填写你的 API Key';$('voice-profile').value=state.settings.voice_profile||'';$('reply-examples').value=state.settings.reply_examples||'';$('work-knowledge').value=state.settings.work_knowledge||'';$('spd-knowledge').value=state.settings.spd_knowledge||'disabled';$('settings-feedback').textContent='';fillDingSettings();$('settings').showModal();}
 $('settings-open').onclick=openSettings;
 $('settings-close').onclick=()=>$('settings').close();
 $('settings').addEventListener('close',()=>{$('api-key').value='';$('ding-vision-key').value='';});
-function formData(){return {dingtalk_image_mode:$('ding-image-mode').value,dingtalk_vision_url:$('ding-vision-url').value.trim(),dingtalk_vision_model:$('ding-vision-model').value.trim(),dingtalk_vision_key:$('ding-vision-key').value.trim(),style:document.querySelector('input[name=style]:checked').value, dingtalk_profile:$('ding-profile').value,dingtalk_conversation:$('ding-conversation').value,dingtalk_name:$('ding-conversation').value?($('ding-conversation').selectedOptions[0]?.textContent||''):'',dingtalk_interval:Number($('ding-interval').value),voice_profile:$('voice-profile').value.trim(),reply_examples:$('reply-examples').value.trim(),work_knowledge:$('work-knowledge').value.trim(),spd_knowledge:$('spd-knowledge').value,base_url:$('base-url').value.trim(),model:$('model').value.trim(),api_key:$('api-key').value.trim(),self_names:$('self-names').value.split('\n').map(x=>x.trim()).filter(Boolean),excluded_senders:$('excluded-senders').value.split('\n').map(x=>x.trim()).filter(Boolean)};}
+function formData(){return {dingtalk_image_mode:$('ding-image-mode').value,dingtalk_vision_url:$('ding-vision-url').value.trim(),dingtalk_vision_model:$('ding-vision-model').value.trim(),dingtalk_vision_key:$('ding-vision-key').value.trim(),style:document.querySelector('input[name=style]:checked').value, dingtalk_profile:$('ding-profile').value,dingtalk_conversation:$('ding-input').dataset.selectedId||'',dingtalk_name:$('ding-input').dataset.selectedName||'',dingtalk_interval:Number($('ding-interval').value),voice_profile:$('voice-profile').value.trim(),reply_examples:$('reply-examples').value.trim(),work_knowledge:$('work-knowledge').value.trim(),spd_knowledge:$('spd-knowledge').value,base_url:$('base-url').value.trim(),model:$('model').value.trim(),api_key:$('api-key').value.trim(),self_names:$('self-names').value.split('\n').map(x=>x.trim()).filter(Boolean),excluded_senders:$('excluded-senders').value.split('\n').map(x=>x.trim()).filter(Boolean)};}
 $('settings-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter;submit.disabled=true;try{await api('settings',formData());$('settings').close();toast('设置已保存');await refresh();}catch(error){$('settings-feedback').textContent=error.message;}finally{submit.disabled=false;}};
 $('test-connection').onclick=async()=>{const button=$('test-connection');button.disabled=true;button.textContent='连接中…';try{const result=await api('test',formData());$('settings-feedback').textContent=result.message;}catch(error){$('settings-feedback').textContent=error.message;}finally{button.disabled=false;button.textContent='测试连接';}};
 $('toggle').onclick=async()=>{if(!state)return;if(!state.enabled&&!state.settings.has_key){openSettings();$('settings-feedback').textContent='先连接云端模型，再开启自动回复';return;}const action=state.enabled||state.starting?'stop':'start';busy=true;$('toggle').disabled=true;if(action==='start'){$('run-label').textContent='正在开启';$('status').textContent='正在连接当前会话…';$('toggle').textContent='正在开启…';}try{render(await api(action,action==='start'?{reply_latest:historyChoice[platform]}:{}));}catch(error){toast(error.message);}finally{busy=false;await refresh();}};
@@ -74,14 +74,53 @@ refresh();setInterval(refresh,1200);
 $('scan').onclick=async()=>{const b=$('scan');b.disabled=true;b.setAttribute('aria-busy','true');b.title='正在读取消息';try{render(await api('scan',{}));}catch(error){toast(error.message);$('status').textContent=error.message;}finally{b.disabled=false;b.removeAttribute('aria-busy');b.title='刷新当前消息';}};
 
 function option(select,value,label){const o=document.createElement('option');o.value=value;o.textContent=label;select.append(o);}
-function fillDingSettings(){const c=state.settings;$('ding-profile').replaceChildren();option($('ding-profile'),'','请选择账号');if(c.dingtalk_profile)option($('ding-profile'),c.dingtalk_profile,'已保存的钉钉账号');$('ding-profile').value=c.dingtalk_profile;$('ding-conversation').replaceChildren();option($('ding-conversation'),'','请选择监听会话');if(c.dingtalk_conversation)option($('ding-conversation'),c.dingtalk_conversation,c.dingtalk_name);$('ding-conversation').value=c.dingtalk_conversation;$('ding-interval').value=c.dingtalk_interval;$('ding-feedback').textContent='';}
-$('ding-profile').onchange=()=>{$('ding-conversation').replaceChildren();option($('ding-conversation'),'','请连接账号后选择会话');};
+function conversationList(prefix){return prefix==='main-ding'?dingMainConversations:dingSettingsConversations;}
+function closeConversation(prefix){const input=$(prefix+'-input');$(prefix+'-options').hidden=true;input.setAttribute('aria-expanded','false');input.removeAttribute('aria-activedescendant');input.dataset.searching='0';input.value=input.dataset.selectedName||'';paintConversations(prefix);}
+function paintConversations(prefix){
+  const input=$(prefix+'-input'),box=$(prefix+'-options'),list=conversationList(prefix);
+  const query=input.dataset.searching==='1'?input.value.trim().toLocaleLowerCase():'';
+  const matches=query?list.filter(c=>String(c.name).toLocaleLowerCase().includes(query)):list;
+  const shown=matches.slice(0,60),selected=list.find(c=>c.id===input.dataset.selectedId);
+  if(!query&&selected&&!shown.some(c=>c.id===selected.id)){shown.unshift(selected);shown.length=Math.min(shown.length,60);}
+  box.replaceChildren();input.removeAttribute('aria-activedescendant');input.dataset.activeIndex='-1';
+  if(!shown.length){const empty=document.createElement('div');empty.className='conversation-empty';empty.textContent=list.length?'没有匹配的会话':'请先加载会话';box.append(empty);}
+  for(const [index,c] of shown.entries()){
+    const item=document.createElement('button');item.type='button';item.id=prefix+'-choice-'+index;item.setAttribute('role','option');item.setAttribute('aria-selected',String(c.id===input.dataset.selectedId));item.textContent=c.name;
+    item.onmousedown=e=>e.preventDefault();item.onclick=()=>chooseConversation(prefix,c);box.append(item);
+  }
+  $(prefix+'-search-count').textContent=list.length?(query?`找到 ${matches.length} / ${list.length} 个会话`:`已加载 ${list.length} 个会话`)+(matches.length>shown.length?' · 继续输入可缩小范围':''):'';
+}
+function setConversation(prefix,id,name){const input=$(prefix+'-input');input.dataset.selectedId=id||'';input.dataset.selectedName=name||'';closeConversation(prefix);}
+function openConversation(prefix){const input=$(prefix+'-input');$(prefix+'-options').hidden=false;input.setAttribute('aria-expanded','true');paintConversations(prefix);}
+function chooseConversation(prefix,item){const previous=$(prefix+'-input').dataset.selectedId;setConversation(prefix,item.id,item.name);if(prefix==='main-ding'&&item.id!==previous)saveMainConversation(item);}
+for(const prefix of ['ding','main-ding']){
+  const input=$(prefix+'-input'),root=$(prefix+'-combo');
+  input.onfocus=()=>{input.dataset.searching='0';input.select();openConversation(prefix);};
+  input.onclick=()=>{if($(prefix+'-options').hidden)openConversation(prefix);};
+  input.oninput=()=>{input.dataset.searching='1';openConversation(prefix);};
+  input.onkeydown=e=>{
+    const options=Array.from($(prefix+'-options').querySelectorAll('[role=option]'));
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+      e.preventDefault();if($(prefix+'-options').hidden){openConversation(prefix);return;}
+      if(!options.length)return;
+      const step=e.key==='ArrowDown'?1:-1,old=Number(input.dataset.activeIndex||'-1');
+      const next=old<0?(step>0?0:options.length-1):(old+step+options.length)%options.length;
+      options.forEach((option,index)=>option.classList.toggle('active',index===next));
+      input.dataset.activeIndex=String(next);input.setAttribute('aria-activedescendant',options[next].id);options[next].scrollIntoView({block:'nearest'});
+    }else if(e.key==='Enter'&&!$(prefix+'-options').hidden){e.preventDefault();options[Math.max(0,Number(input.dataset.activeIndex||'-1'))]?.click();}
+    else if(e.key==='Escape'&&!$(prefix+'-options').hidden){e.preventDefault();closeConversation(prefix);}
+  };
+  input.onblur=()=>setTimeout(()=>{if(!root.contains(document.activeElement))closeConversation(prefix);},0);
+}
+document.addEventListener('pointerdown',e=>{for(const prefix of ['ding','main-ding'])if(!$(prefix+'-combo').contains(e.target)&&!$(prefix+'-options').hidden)closeConversation(prefix);});
+function fillDingSettings(){const c=state.settings;dingSettingsConversations=[];$('ding-profile').replaceChildren();option($('ding-profile'),'','请选择账号');if(c.dingtalk_profile)option($('ding-profile'),c.dingtalk_profile,'已保存的钉钉账号');$('ding-profile').value=c.dingtalk_profile;setConversation('ding',c.dingtalk_conversation,c.dingtalk_name);$('ding-interval').value=c.dingtalk_interval;$('ding-feedback').textContent='';}
+$('ding-profile').onchange=()=>{dingSettingsConversations=[];setConversation('ding','','');};
 $('ding-profiles').onclick=async()=>{const b=$('ding-profiles');b.disabled=true;try{const data=await api('dingtalk-profiles',{});const saved=$('ding-profile').value;$('ding-profile').replaceChildren();option($('ding-profile'),'','请选择账号');for(const p of data.profiles)option($('ding-profile'),p.profile,p.userName+' · '+p.corpName);if(data.profiles.some(p=>p.profile===saved))$('ding-profile').value=saved;else{const current=data.profiles.filter(p=>p.isOrgCurrent);if(current.length===1)$('ding-profile').value=current[0].profile;$('ding-profile').onchange();}$('ding-feedback').textContent=data.profiles.length?'请选择账号，然后连接加载会话':'未找到登录账号，请查看下方连接说明';}catch(e){$('ding-feedback').textContent=e.message;}finally{b.disabled=false;}};
-$('ding-connect').onclick=async()=>{const b=$('ding-connect');b.disabled=true;$('ding-feedback').textContent='正在核对本人身份并读取会话…';const profile=$('ding-profile').value;try{const data=await api('dingtalk-connect',{profile});if($('ding-profile').value!==profile)return;const saved=$('ding-conversation').value;$('ding-conversation').replaceChildren();option($('ding-conversation'),'','请选择监听会话');for(const c of data.conversations)option($('ding-conversation'),c.id,c.name);if(data.conversations.some(c=>c.id===saved))$('ding-conversation').value=saved;$('ding-feedback').textContent=data.name+' · 已连接'+(data.complete?'':'（当前仅加载部分会话）');}catch(e){$('ding-feedback').textContent=e.message;}finally{b.disabled=false;}};
+$('ding-connect').onclick=async()=>{const b=$('ding-connect');b.disabled=true;$('ding-feedback').textContent='正在核对本人身份并读取会话…';const profile=$('ding-profile').value;try{const data=await api('dingtalk-connect',{profile});if($('ding-profile').value!==profile)return;dingSettingsConversations=data.conversations;paintConversations('ding');$('ding-feedback').textContent=data.name+' · 已连接'+(data.complete?'':'（当前仅加载部分会话）');}catch(e){$('ding-feedback').textContent=e.message;}finally{b.disabled=false;}};
 document.querySelectorAll('[data-platform]').forEach(button=>button.onclick=()=>{if(busy)return;platform=button.dataset.platform;refresh().then(()=>{if(platform==='dingtalk'&&state.settings.dingtalk_profile&&dingListProfile!==state.settings.dingtalk_profile)loadMainConversations();});});
 
 $('ding-login').onclick=async()=>{try{$('ding-feedback').textContent=(await api('dingtalk-login',{})).message;}catch(e){$('ding-feedback').textContent=e.message;}};
 
-async function loadMainConversations(){const b=$('main-ding-refresh');if(!state.settings.dingtalk_profile){openSettings();$('ding-feedback').textContent='先连接并保存钉钉账号，再在主页选择会话';return;}b.disabled=true;const profile=state.settings.dingtalk_profile;try{const data=await api('dingtalk-conversations',{profile});if(state.settings.dingtalk_profile!==profile)return;$('main-ding-conversation').replaceChildren();option($('main-ding-conversation'),'','请选择会话');for(const c of data.conversations)option($('main-ding-conversation'),c.id,c.name);dingListProfile=profile;$('main-ding-conversation').value=state.settings.dingtalk_conversation;if(!data.complete)toast('已加载部分会话，可刷新列表重试');}catch(e){toast(e.message);}finally{b.disabled=false;}}
+async function loadMainConversations(){const b=$('main-ding-refresh');if(!state.settings.dingtalk_profile){openSettings();$('ding-feedback').textContent='先连接并保存钉钉账号，再在主页选择会话';return;}b.disabled=true;const profile=state.settings.dingtalk_profile;try{const data=await api('dingtalk-conversations',{profile});if(state.settings.dingtalk_profile!==profile)return;dingMainConversations=data.conversations;dingListProfile=profile;paintConversations('main-ding');if(!data.complete)toast('已加载部分会话，可刷新列表重试');}catch(e){toast(e.message);}finally{b.disabled=false;}}
 $('main-ding-refresh').onclick=loadMainConversations;
-$('main-ding-conversation').onchange=async()=>{const select=$('main-ding-conversation');busy=true;select.disabled=true;try{await api('settings',{dingtalk_conversation:select.value,dingtalk_name:select.value?select.selectedOptions[0].textContent:''});toast('钉钉会话已选择，请点击开启自动回复');}catch(e){toast(e.message);}finally{busy=false;await refresh();}};
+async function saveMainConversation(item){const input=$('main-ding-input');busy=true;input.disabled=true;try{await api('settings',{dingtalk_conversation:item.id,dingtalk_name:item.name});toast('钉钉会话已选择，请点击开启自动回复');}catch(e){setConversation('main-ding',state.settings.dingtalk_conversation,state.settings.dingtalk_name);toast(e.message);}finally{busy=false;input.disabled=false;await refresh();}}
