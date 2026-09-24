@@ -1,5 +1,6 @@
 """DingTalk user API adapter. Fixed profile/target, no UI automation or shell expansion."""
 import hashlib
+import copy
 import json
 import os
 import subprocess
@@ -68,6 +69,7 @@ class DingTalk:
         self.checked = 0
         self.stream = None
         self.image_cache = {}
+        self.live_messages = None
 
     def permissions(self):
         return {'screen': None, 'accessibility': True, 'connected': bool(self.account),
@@ -94,6 +96,66 @@ class DingTalk:
             return {'name': name, 'organization': account['corpName'], 'connected': True}
 
     def read(self):
+        if self.live_messages is not None:
+            return self.read_live()
+        return self.read_history()
+
+    def initial_snapshot(self):
+        # History is useful context, not a prerequisite for an event subscription.
+        self.live_messages = None
+        try:
+            return self.read_history()
+        except ReadUnavailable:
+            cfg = self.config.data
+            if not self.account or self.account['profile'] != cfg['dingtalk_profile']:
+                raise
+            return {**self.snapshot([]), 'history_unavailable': True}
+
+    def snapshot(self, messages):
+        cfg = self.config.data
+        profile, cid = cfg['dingtalk_profile'], cfg['dingtalk_conversation']
+        return {'platform': 'dingtalk', 'profile': profile, 'conversation_id': cid,
+                'window': {'wid': 'dingtalk:' + profile + ':' + cid},
+                'chat_title': cfg['dingtalk_name'] or '钉钉会话', 'messages': messages}
+
+    def listening_snapshot(self, snapshot):
+        # Do not absorb events received during startup into the old-message baseline.
+        return snapshot
+
+    def read_live(self):
+        with self.lock:
+            if self.stream.error or self.stream.closed.is_set():
+                raise ValueError(self.stream.error or '钉钉实时连接已关闭')
+            known = {m.message_id for m in self.live_messages}
+            for event in self.stream.drain():
+                if event.get('conversation_id') != self.config.data['dingtalk_conversation']:
+                    continue
+                mid = event.get('message_id')
+                if not mid or mid in known:
+                    continue
+                sender = event.get('sender_open_dingtalk_id')
+                if not isinstance(sender, str):
+                    sender = ''
+                text = event.get('content')
+                resources = not isinstance(text, str) or not text.strip()
+                if isinstance(text, str):
+                    resources = resources or text.strip() in ('[图片]', '[表情]', '[文件]')
+                    try:
+                        payload = json.loads(text)
+                        resources = resources or (isinstance(payload, (dict, list))
+                            and any(key in text for key in ('"mediaId"', '"fileId"')))
+                    except ValueError:
+                        pass
+                self.live_messages.append(SimpleNamespace(
+                    text='[图片或附件，内容未读取]' if resources else text,
+                    sender=event.get('sender') if isinstance(event.get('sender'), str) else '', sender_id=sender, message_id=mid,
+                    side='me' if sender in self.own_ids else 'them' if sender else 'unknown',
+                    conf=1 if sender else 0, kind='text', has_resources=resources))
+                known.add(mid)
+            self.live_messages = self.live_messages[-100:]
+            return self.snapshot(copy.deepcopy(self.live_messages))
+
+    def read_history(self):
         cfg = self.config.data.copy()
         profile, cid = cfg['dingtalk_profile'], cfg['dingtalk_conversation']
         if not profile or not cid:
@@ -167,10 +229,13 @@ class DingTalk:
             args = ['event', '+listen-im', '--kind', 'group', '--chat-id', cid]
         self.stream = MessageStream([str(DWS), *args, '--flatten', '--format', 'ndjson', '--profile', profile], cid)
         self.stream.start()
+        self.live_messages = copy.deepcopy(snapshot['messages'])
 
     def end_listening(self):
-        if self.stream:
-            self.stream.close()
+        with self.lock:
+            if self.stream:
+                self.stream.close()
+            self.live_messages = None
 
     def has_update(self):
         return self.stream.poll() if self.stream else False
@@ -205,6 +270,19 @@ class DingTalk:
                 status = status.get('result', status)
                 if isinstance(status, dict) and status.get('openConversationId') == cid:
                     mid = status.get('openMessageId')
+            if self.live_messages is not None and mid:
+                # The stream filters our own messages. Confirm this exact send by ID,
+                # without depending on the conversation's history list being available.
+                receipt = run(['chat', '+messages-mget', '--msg-ids', mid, '--no-reactions'], profile)
+                matches = [m for m in receipt.get('messages', [])
+                           if m.get('messageId') == mid and m.get('conversationId') == cid
+                           and m.get('senderId') in self.own_ids and m.get('text') == text]
+                if not receipt.get('partial') and not receipt.get('failures') and len(matches) == 1:
+                    with self.lock:
+                        if not any(m.message_id == mid for m in self.live_messages):
+                            self.live_messages.append(SimpleNamespace(text=str(text), sender=matches[0].get('sender') or '',
+                                side='me', conf=1, kind='text', message_id=mid,
+                                sender_id=matches[0]['senderId'], has_resources=False))
             result = self.read()
             if identity(result) != identity(expected):
                 break

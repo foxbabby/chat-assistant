@@ -52,7 +52,6 @@ class DingTalkTests(unittest.TestCase):
         result=self.adapter.read()
         self.assertEqual([m.side for m in result['messages']],['me','them'])
     def test_two_stage_reply_quotes_original_with_distinct_idempotency(self):
-        self.cfg.save({'spd_knowledge':'enabled'})
         e=self.engine()
         def generate(*args):return '查到的规则。'
         generate.supports_research_ack=True

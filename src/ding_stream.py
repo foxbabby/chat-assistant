@@ -2,6 +2,8 @@
 import json
 import subprocess
 import threading
+import copy
+from collections import deque
 
 
 class MessageStream:
@@ -13,17 +15,29 @@ class MessageStream:
         self.process = None
         self.error = ''
         self.seen = set()
+        self.lock = threading.RLock()
+        self.messages = deque(maxlen=200)
 
     def accept(self, event):
         if not isinstance(event, dict) or event.get('conversation_id') != self.cid:
             return
         mid = event.get('message_id')
-        if not isinstance(mid, str) or not mid or mid in self.seen:
+        if not isinstance(mid, str) or not mid:
             return
-        if len(self.seen) >= 2000:
-            self.seen.clear()
-        self.seen.add(mid)
-        self.changed.set()
+        with self.lock:
+            if mid in self.seen:
+                return
+            if len(self.seen) >= 2000:
+                self.seen.clear()
+            self.seen.add(mid)
+            self.messages.append(copy.deepcopy(event))
+            self.changed.set()
+
+    def drain(self):
+        with self.lock:
+            messages = list(self.messages)
+            self.messages.clear()
+            return messages
 
     def start(self):
         self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

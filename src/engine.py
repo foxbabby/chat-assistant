@@ -2,11 +2,12 @@ import copy
 import hashlib
 import json
 import re
+import uuid
 import threading
 import time
 from datetime import datetime
 from config import DATA_DIR, atomic_json
-from cloud import reply, CloudError, NeedsReview
+from cloud import reply, CloudError, NeedsReview, review_clarification
 from wechat import identity, signature, ReadUnavailable
 
 
@@ -59,6 +60,10 @@ class Engine:
     def __init__(self, config, adapter, generator=reply, directory=DATA_DIR):
         self.config, self.adapter, self.generator = config, adapter, generator
         self.lock = threading.RLock()
+        self.operation = threading.Lock()
+        self.closed = threading.Event()
+        self.auto_reply = True
+        self.pending = None
         self.enabled = False
         self.starting = False
         self.epoch = 0
@@ -66,6 +71,11 @@ class Engine:
         self.baseline = None
         self.status = '选择一种风格，连接云端后即可开始'
         self.events = []
+        self.activity = None
+        self.session_path = directory / 'listening.json'
+        self.restore_attempted = False
+        self.start_retry = None
+        self.start_retry_attempts = 0
         self.latest = None
         self.count = 0
         self.ledger_path = directory / 'processed.json'
@@ -100,21 +110,107 @@ class Engine:
         with self.lock:
             return {'enabled': self.enabled, 'starting': self.starting, 'status': self.status,
                     'target': self.target[1] if self.target else '', 'count': self.count,
-                    'events': list(self.events), 'latest': self.latest,
+                    'activity': copy.deepcopy(self.activity), 'events': list(self.events), 'latest': copy.deepcopy(self.latest),
+                    'auto_reply': self.auto_reply,
                     'settings': self.config.public(), 'permissions': self.adapter.permissions()}
 
     def event(self, text):
         self.events.insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'text': text})
         self.events = self.events[:30]
 
-    def stop(self, reason='已暂停自动回复'):
+    def mark_activity(self, phase, label):
+        self.activity = {'phase': phase, 'label': label, 'at': time.time(),
+                         'time': datetime.now().strftime('%H:%M:%S')}
+
+    def save_listening(self, enabled):
+        atomic_json(self.session_path, {'enabled': enabled, 'auto_reply': self.auto_reply,
+                    'target': self.target[1] if self.target else (self.start_retry or {}).get('target') or ''})
+
+    def restore_listening(self):
+        # Serialize with user start/stop so a late restore cannot undo a pause.
         with self.lock:
+            if self.restore_attempted:
+                return
+            self.restore_attempted = True
+            if self.enabled or self.starting or not self.session_path.exists():
+                return
+            try:
+                saved = json.loads(self.session_path.read_text())
+                if not isinstance(saved, dict):
+                    return
+                if not isinstance(saved.get('auto_reply'), bool) or not isinstance(saved.get('target'), str):
+                    raise ValueError('保存的监听状态不完整，请重新开启')
+                self.auto_reply = saved['auto_reply']
+                if saved.get('enabled') is not True:
+                    self.status = '已恢复上次暂停状态'
+                    return
+                self.start(auto_reply=saved['auto_reply'], reply_latest=False,
+                           expected_title=saved['target'])
+                self.event('正在恢复上次监听；已有消息不补发' if self.starting else '已恢复上次监听；已有消息不补发')
+            except (ValueError, OSError):
+                self.status = '开启失败：未能恢复上次监听，请核对原会话、权限和连接后重新开启'
+                self.event(self.status)
+
+    def settings_updated(self):
+        """Cancel old drafts without disconnecting or replacing the message baseline."""
+        with self.lock:
+            # Starting has no generation in flight; changing its epoch would strand it.
+            if not self.starting:
+                self.epoch += 1
+            self.invalidate_pending('设置已更新，旧回复已取消')
+            if self.enabled:
+                self.status = '设置已更新，继续监听新消息'
+                self.mark_activity('idle', self.status)
+                self.save_listening(True)
+            self.event('回复设置已更新，监听状态保持不变')
+
+    def stop(self, reason='已暂停监听', *, preserve_session=False):
+        with self.lock:
+            self.restore_attempted = True
+            if not preserve_session:
+                self.save_listening(False)
             self.epoch += 1
+            self.start_retry = None
+            self.start_retry_attempts = 0
+            self.invalidate_pending('监听已暂停，待发送回复已取消')
+            self.mark_activity('paused', reason)
             self.enabled = self.starting = False
             self.status = reason
             self.event(reason)
             if hasattr(self.adapter, 'end_listening'):
                 self.adapter.end_listening()
+
+    def invalidate_pending(self, reason):
+        if self.pending and self.latest:
+            self.latest.pop('pending_id', None)
+            self.latest['state'] = reason
+            self.mark_activity('updated', reason)
+        self.pending = None
+
+    def send_pending(self, pending_id, discard=False):
+        if not self.operation.acquire(blocking=False):
+            raise ValueError('正在处理消息，请稍后重试')
+        try:
+            with self.lock:
+                pending = self.pending
+                if not pending or pending['id'] != pending_id or not self.enabled:
+                    raise ValueError('这条回复已失效或已处理，请刷新页面')
+                epoch = self.epoch
+                self.invalidate_pending('已忽略，继续监听' if discard else '发送前校验')
+                if discard:
+                    self.status = '已忽略这条回复，继续监听新消息'
+                    return
+            try:
+                fresh = self.adapter.read()
+                snap = pending['snapshot']
+                if identity(fresh) != identity(snap) or signature(fresh) != signature(snap):
+                    raise ValueError('会话或消息已变化，未发送；请查看最新消息')
+                self.deliver(pending['answer'], snap, pending['key'], epoch, pending['style'])
+            except Exception:
+                self.stop('人工发送未完成或结果未确认，请核对聊天窗口；不会自动重发')
+                raise
+        finally:
+            self.operation.release()
 
     def show_snapshot(self, snapshot, label):
         messages = snapshot.get('messages', [])
@@ -127,44 +223,102 @@ class Engine:
         with self.lock:
             if not self.enabled and not self.starting:
                 self.target = identity(snapshot)
-                self.show_snapshot(snapshot, '仅显示当前消息，未开启自动回复')
-                self.status = '已读取当前消息；自动回复未开启'
+                self.show_snapshot(snapshot, '仅显示当前消息，未开始监听')
+                self.status = '已读取当前消息；监听未开启'
         return snapshot
 
-    def start(self, reply_latest=False):
+    def retry_startup(self):
         with self.lock:
+            retry = self.start_retry
+            if retry is None:
+                return False
+            if time.monotonic() < retry['at']:
+                return True
+        try:
+            self.start(auto_reply=retry['auto_reply'], reply_latest=False,
+                       expected_title=retry['target'], _retry_epoch=retry['epoch'])
+        except ValueError as error:
+            with self.lock:
+                if self.start_retry is None and not self.enabled and not self.starting:
+                    self.stop('开启失败：' + str(error))
+        return True
+
+    def start(self, reply_latest=False, auto_reply=True, *, expected_title=None, _retry_epoch=None):
+        with self.lock:
+            if _retry_epoch is not None:
+                if self.start_retry is None or self.epoch != _retry_epoch:
+                    return
+                self.start_retry = None
+                self.starting = False
+            if self.closed.is_set():
+                raise ValueError('会话已移除，请重新选择')
             if self.enabled or self.starting:
                 return
+            if _retry_epoch is None:
+                self.start_retry_attempts = 0
             if not self.config.data['api_key']:
                 raise ValueError('请先在设置中填写 API Key')
             permissions = self.adapter.permissions()
             if not permissions.get('accessibility'):
                 raise ValueError('请先完成辅助功能授权')
+            self.restore_attempted = True
             self.epoch += 1
             epoch = self.epoch
+            self.auto_reply = auto_reply
             self.starting = True
             self.status = '正在识别当前会话…'
         try:
-            snapshot = self.adapter.read()
+            snapshot = (self.adapter.initial_snapshot() if hasattr(self.adapter, 'initial_snapshot')
+                        else self.adapter.read())
+            if expected_title is not None and expected_title and identity(snapshot)[1] != expected_title:
+                raise ValueError('当前会话与退出前不同，请切回原会话后重新开启')
             if hasattr(self.adapter, 'begin_listening'):
                 self.adapter.begin_listening(snapshot)
                 if self.epoch != epoch:
                     self.adapter.end_listening()
                     return
-                snapshot = self.adapter.read()
+                snapshot = (self.adapter.listening_snapshot(snapshot) if hasattr(self.adapter, 'listening_snapshot')
+                            else self.adapter.read())
             with self.lock:
                 if self.epoch != epoch:
                     return
+                if expected_title and identity(snapshot)[1] != expected_title:
+                    raise ValueError('会话已变化，请核对原会话后重新开启')
                 self.target = identity(snapshot)
+                reply_latest = reply_latest and not snapshot.get('history_unavailable', False)
                 self.baseline = signature(snapshot)[:-1] if reply_latest else signature(snapshot)
                 self.enabled, self.starting = True, False
+                self.start_retry = None
+                self.start_retry_attempts = 0
                 self.initial_tick = reply_latest
                 self.status = '实时连接已就绪，等待新消息' if hasattr(self.adapter, 'has_update') else '等待当前会话的新消息'
-                self.event('自动回复已开启 · ' + self.target[1])
+                if snapshot.get('history_unavailable'):
+                    self.status = '新消息监听已就绪，历史消息暂不可用；仅处理后续新消息'
+                self.save_listening(True)
+                self.mark_activity('idle', '等待新消息')
+                self.event('监听已开启 · ' + self.target[1])
                 self.show_snapshot(snapshot, '将核对并回复当前最后一条消息' if reply_latest else '当前已有消息，仅显示；等待新消息')
                 if reply_latest:
                     self.status = '准备回复当前最后一条消息…'
         except ReadUnavailable as error:
+            if getattr(self.adapter, 'platform', '') == 'dingtalk':
+                with self.lock:
+                    if self.epoch != epoch or self.closed.is_set():
+                        return
+                    self.adapter.end_listening()
+                    self.start_retry_attempts += 1
+                    delay = min(60, 5 * 2 ** min(self.start_retry_attempts - 1, 4))
+                    self.start_retry = {'at': time.monotonic() + delay, 'epoch': epoch,
+                                        'target': expected_title, 'auto_reply': auto_reply}
+                    self.enabled, self.starting = False, True
+                    self.status = f'消息暂不可读取，{delay} 秒后自动重试：' + str(error)
+                    self.mark_activity('connecting', self.status)
+                    self.save_listening(True)
+                    self.event(self.status)
+                return
+            if expected_title is not None:
+                self.enabled = self.starting = False
+                raise ValueError('原会话暂不可读取，请恢复会话后重新开启') from None
             if hasattr(self.adapter, 'end_listening'):
                 self.adapter.end_listening()
                 self.stop('开启失败：' + str(error))
@@ -174,7 +328,8 @@ class Engine:
                     self.enabled, self.starting = True, False
                     self.target = self.baseline = None
                     self.latest = None
-                    self.status = '自动回复已开启，等待会话：' + str(error)
+                    self.status = '监听已开启，等待会话：' + str(error)
+                    self.save_listening(True)
                     self.event('已开启监听，等待会话可读取')
         except Exception as error:
             if hasattr(self.adapter, 'end_listening'):
@@ -188,6 +343,14 @@ class Engine:
             raise ValueError(reason) from None
 
     def tick(self):
+        if not self.operation.acquire(blocking=False):
+            return False
+        try:
+            return self._tick()
+        finally:
+            self.operation.release()
+
+    def _tick(self):
         with self.lock:
             if not self.enabled:
                 return
@@ -211,11 +374,13 @@ class Engine:
                     self.baseline = signature(snap)
                     self.show_snapshot(snap, '当前已有消息，仅显示；继续等待新消息')
                     self.status = '正在监听当前会话，等待新消息'
+                    self.save_listening(True)
                     self.event('会话已就绪，继续监听')
                     return
                 sig = signature(snap)
                 if sig == self.baseline:
                     return
+                self.invalidate_pending("新消息已到达，旧回复已失效")
                 messages = snap['messages']
                 if (self.baseline and len(sig) == len(self.baseline)
                         and any(m[0] == 'unknown' for m in self.baseline)
@@ -274,6 +439,8 @@ class Engine:
                     self.status = '已跳过识别不清晰的消息，继续等待新消息'
                     return
                 config = self.config.data.copy()
+                self.mark_activity('generating', '新消息 · 正在生成回复')
+                self.event('收到新消息，正在生成回复')
                 self.status = '正在生成' + config['style'] + '回复…'
                 self.latest = {'incoming': messages[-1].text, 'reply': '', 'state': '生成中'}
             history = copy.deepcopy(messages)
@@ -285,7 +452,7 @@ class Engine:
             from cloud import work_query
             acknowledged = False
             # Only the production knowledge generator opts in; previews do not send.
-            if (getattr(self.generator, 'supports_research_ack', False) is True
+            if (self.auto_reply and getattr(self.generator, 'supports_research_ack', False) is True
                     and work_query(history)[1] and config.get('spd_knowledge') == 'enabled'):
                 acknowledgement = '我查一下相关资料，稍等。'
                 original = copy.deepcopy(messages[-1])
@@ -295,6 +462,7 @@ class Engine:
                     self.reserve_outgoing(snap, acknowledgement)
                     self.processed.add('research:'+key)
                     atomic_json(self.ledger_path, sorted(self.processed))
+                    self.mark_activity('sending', '正在发送查询提示')
                     self.status = '正在发送查询提示…'
                 snap = self.adapter.send(acknowledgement, snap, lambda: self.enabled and self.epoch == epoch)
                 acknowledged = True
@@ -306,6 +474,7 @@ class Engine:
                         return
                     self.baseline = signature(snap)
                     self.latest['state'] = '已告知稍等，正在查资料'
+                    self.mark_activity('generating', '正在查询资料并生成回复')
                     self.status = '已告知稍等，正在查询 SPD 资料…'
                     self.event('已发送查询提示，正在查资料')
             try:
@@ -327,7 +496,7 @@ class Engine:
                 if getattr(messages[-1], 'has_resources', False) or getattr(messages[-1], 'kind', 'text') in ('image', 'sticker'):
                     answer = Draft('图片收到了，方便用文字补充一下重点吗？', warnings=['图片未能可靠识别，本次仅追问内容'])
                 else:
-                    answer = work_clarification(messages[-1].text) or Draft('这点我还不确定，方便再具体说一下吗？', warnings=['本次发送澄清追问，未采用未经确认的答案'])
+                    answer = review_clarification(messages[-1].text, error)
                 if acknowledged and not isinstance(error, NeedsReview):
                     answer = Draft('这次查询暂时没完成，还不能给你准确结论。方便补充一下具体页面或现场版本吗？', warnings=['资料查询或模型服务失败，本次发送进度说明'])
             with self.lock:
@@ -335,46 +504,68 @@ class Engine:
                     return
                 self.latest = {'incoming': messages[-1].text, 'reply': answer, 'state': '发送前校验',
                                'image_path': getattr(answer, 'image_path', None), 'sources': getattr(answer, 'sources', []), 'knowledge_warnings': getattr(answer, 'warnings', [])}
-                self.status = '正在核对会话并发送…'
-                # Durable reservation before ANY write; ambiguous sends never retry after restart.
-                if not getattr(answer, 'image_path', None):
-                    self.reserve_outgoing(snap, answer)
-                else:
-                    self.outbox['image-pending:'+self.outgoing_key(snap,'')] = time.time()
-                    atomic_json(self.outbox_path, self.outbox)
-                self.processed.add(key)
-                atomic_json(self.ledger_path, sorted(self.processed))
-            if getattr(answer, 'image_path', None):
-                from image_sender import send_image
-                sent = send_image(self.adapter, answer.image_path, snap, lambda: self.enabled and self.epoch == epoch)
-                with self.lock:
-                    self.processed.add('image:'+digest(sent))
-                    atomic_json(self.ledger_path, sorted(self.processed))
-                    self.outbox.pop('image-pending:'+self.outgoing_key(snap,''), None)
-                    atomic_json(self.outbox_path,self.outbox)
-            else:
-                sent = self.adapter.send(answer, snap, lambda: self.enabled and self.epoch == epoch)
-            with self.lock:
-                if epoch != self.epoch:
+                if not self.auto_reply:
+                    pending_id = uuid.uuid4().hex
+                    self.pending = {'id': pending_id, 'snapshot': copy.deepcopy(snap),
+                                    'answer': answer, 'key': key, 'style': config['style']}
+                    self.latest.update(state='待人工确认发送', pending_id=pending_id)
+                    self.status = '回复已生成，等待人工发送；继续监听新消息'
+                    self.mark_activity('pending', '回复已生成 · 待确认')
+                    self.event('已生成回复，待人工确认')
                     return
-                self.baseline = signature(sent)
-                self.count += 1
-                self.latest['state'] = '已发送并确认'
-                self.status = '等待当前会话的新消息'
-                self.event('已发送 · ' + config['style'])
+            self.deliver(answer, snap, key, epoch, config['style'])
         except NeedsReview as error:
             with self.lock:
                 if epoch == self.epoch and self.enabled:
                     self.status = str(error)
                     self.show_snapshot(snap, str(error))
+                    self.mark_activity('review', '需要人工核对')
                     self.event('工作问题待人工确认，未发送；继续监听')
         except (ValueError, CloudError) as error:
             self.stop(str(error))
         except Exception:
             self.stop('处理失败，已暂停；请检查权限、网络和平台状态')
 
+    def deliver(self, answer, snap, key, epoch, style):
+        with self.lock:
+            if epoch != self.epoch or not self.enabled:
+                return
+            self.mark_activity('sending', '正在发送回复')
+            self.status = '正在核对会话并发送…'
+            # Durable reservation before ANY write; ambiguous sends never retry after restart.
+            if not getattr(answer, 'image_path', None):
+                self.reserve_outgoing(snap, answer)
+            else:
+                self.outbox['image-pending:'+self.outgoing_key(snap,'')] = time.time()
+                atomic_json(self.outbox_path, self.outbox)
+            self.processed.add(key)
+            atomic_json(self.ledger_path, sorted(self.processed))
+        if getattr(answer, 'image_path', None):
+            from image_sender import send_image
+            sent = send_image(self.adapter, answer.image_path, snap, lambda: self.enabled and self.epoch == epoch)
+            with self.lock:
+                self.processed.add('image:'+digest(sent))
+                atomic_json(self.ledger_path, sorted(self.processed))
+                self.outbox.pop('image-pending:'+self.outgoing_key(snap,''), None)
+                atomic_json(self.outbox_path,self.outbox)
+        else:
+            sent = self.adapter.send(answer, snap, lambda: self.enabled and self.epoch == epoch)
+        with self.lock:
+            if epoch != self.epoch:
+                return
+            self.baseline = signature(sent)
+            self.count += 1
+            self.latest['state'] = '已发送并确认'
+            self.status = '等待当前会话的新消息'
+            self.mark_activity('sent', '已回复并确认')
+            self.event('已发送 · ' + style)
+
     def run(self):
-        while True:
+        self.restore_listening()
+        while not self.closed.is_set():
+            if self.retry_startup():
+                time.sleep(0.2)
+                continue
             if hasattr(self.adapter, 'has_update'):
                 if self.enabled:
                     try:

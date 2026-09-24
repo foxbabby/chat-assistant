@@ -10,7 +10,7 @@ from test_assistant import FakeWeChat,snap,msg
 class ResearchReplyTests(unittest.TestCase):
  def run_case(self,mode):
   with tempfile.TemporaryDirectory() as tmp:
-   cfg=Config(Path(tmp));cfg.save({'api_key':'placeholder','spd_knowledge':'enabled'})
+   cfg=Config(Path(tmp));cfg.save({'api_key':'placeholder'})
    adapter=FakeWeChat(snap(msg('旧消息')))
    def generate(*args):
     self.assertEqual(adapter.sent,['我查一下相关资料，稍等。'])
@@ -44,7 +44,7 @@ class ResearchReplyTests(unittest.TestCase):
  def test_pause_cancels_answer(self):self.run_case('pause')
  def test_uncertain_ack_delivery_never_starts_lookup(self):
   with tempfile.TemporaryDirectory() as tmp:
-   cfg=Config(Path(tmp));cfg.save({'api_key':'placeholder','spd_knowledge':'enabled'})
+   cfg=Config(Path(tmp));cfg.save({'api_key':'placeholder'})
    adapter=FakeWeChat(snap(msg('旧消息')))
    def generate(*args):self.fail('must not query after unknown delivery')
    generate.supports_research_ack=True

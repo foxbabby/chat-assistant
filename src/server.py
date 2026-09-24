@@ -2,12 +2,13 @@ import hmac
 import json
 import secrets
 import threading
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
 from config import Config, STYLES, validate
-from cloud import completion, reply, CloudError
+from cloud import completion, reply, CloudError, NeedsReview, review_clarification
 from engine import Engine
 from wechat import WeChat
 
@@ -19,13 +20,16 @@ def make_server(port=18766, config=None, adapter=None):
     adapter = adapter or WeChat()
     engine = Engine(config, adapter, directory=config.path.parent)
     from dingtalk import DingTalk
-    ding_adapter = DingTalk(config)
-    engines = {'wechat': engine, 'dingtalk': Engine(config, ding_adapter, directory=config.path.parent / 'dingtalk')}
+    from ding_pool import DingTalkPool
+    pool = DingTalkPool(config)
+    engines = {'wechat': engine, 'dingtalk': pool}
     settings_lock = threading.RLock()
     login = SimpleNamespace(process=None)
-    def state_for(platform):
+    def state_for(platform, cid=''):
         states = {name: worker.state() for name, worker in engines.items()}
-        return {**states[platform], 'platform': platform, 'platforms': states}
+        selected = pool.get(cid).state() if platform == 'dingtalk' else states[platform]
+        return {**selected, 'platform': platform, 'platforms': states, 'rooms': pool.rooms(),
+                'conversation_id': pool.get(cid).config.data['dingtalk_conversation'] if platform == 'dingtalk' else ''}
     token = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -59,7 +63,11 @@ def make_server(port=18766, config=None, adapter=None):
             platform = parse_qs(urlparse(self.path).query).get('platform', ['wechat'])[0]
             if platform not in engines:
                 return self.respond({'error': '平台不正确'}, 400)
-            engine = engines[platform]
+            cid = parse_qs(urlparse(self.path).query).get('conversation_id', [''])[0]
+            try:
+                engine = pool.get(cid) if platform == 'dingtalk' else engines[platform]
+            except ValueError as error:
+                return self.respond({'error': str(error)}, 400)
             if route == '/api/diagnostics':
                 if not self.authenticated():
                     return self.respond({'error': '请重新打开助手'}, 403)
@@ -84,7 +92,7 @@ def make_server(port=18766, config=None, adapter=None):
             if route == '/api/state':
                 if not self.authenticated():
                     return self.respond({'error': '请重新打开助手'}, 403)
-                return self.respond(state_for(platform))
+                return self.respond(state_for(platform, cid))
             files = {'/': ('index.html', 'text/html; charset=utf-8'),
                      '/app-icon.png': ('app-icon.png', 'image/png'),
                      '/app.css': ('app.css', 'text/css'), '/app.js': ('app.js', 'text/javascript')}
@@ -109,7 +117,8 @@ def make_server(port=18766, config=None, adapter=None):
                 platform = data.pop('platform', 'wechat')
                 if platform not in engines:
                     raise ValueError('平台不正确')
-                engine = engines[platform]
+                cid = str(data.pop('conversation_id', ''))
+                engine = pool.get(cid) if platform == 'dingtalk' else engines[platform]
                 if self.path == '/api/dingtalk-login':
                     import subprocess
                     from dingtalk import DWS
@@ -139,12 +148,40 @@ def make_server(port=18766, config=None, adapter=None):
                     return self.respond({**probe.connect(profile), **conversations(profile)})
                 if self.path == '/api/scan':
                     engine.scan()
-                    return self.respond(state_for(platform))
+                    return self.respond(state_for(platform, cid))
+                if self.path == '/api/dingtalk-rooms':
+                    from dingtalk import conversations
+                    with settings_lock, pool.lock:
+                        rooms = data.get('rooms')
+                        candidate = validate({**config.data, 'dingtalk_rooms':rooms,
+                                              'dingtalk_conversation':'', 'dingtalk_name':''})['dingtalk_rooms']
+                        old = {r['id']:r for r in config.data['dingtalk_rooms']}
+                        added = [r for r in candidate if r['id'] not in old]
+                        if added:
+                            listing = {r['id']:r['name'] for r in conversations(config.data['dingtalk_profile'])['conversations']}
+                            if any(r['id'] not in listing for r in added):
+                                raise ValueError('请从当前账号会话列表中选择')
+                        else:
+                            listing = {}
+                        for room in candidate:
+                            room['name'] = old[room['id']]['name'] if room['id'] in old else listing[room['id']]
+                            if room['id'] in old and any(room[k] != old[room['id']][k] for k in ('auto_reply','reply_latest')):
+                                pool.get(room['id']).stop('回复选项已更改，请重新开启此会话')
+                        config.save({'dingtalk_rooms':candidate,
+                                     'dingtalk_conversation':candidate[0]['id'] if candidate else '',
+                                     'dingtalk_name':candidate[0]['name'] if candidate else ''})
+                        pool.sync()
+                    # Removed selection must not make a successful save appear to fail.
+                    return self.respond(state_for(platform, cid if any(r['id']==cid for r in candidate) else ''))
                 if self.path == '/api/settings':
+                    if 'dingtalk_rooms' in data:
+                        raise ValueError('请通过会话管理保存监听列表')
                     with settings_lock:
                         if data.get('dingtalk_profile', config.data['dingtalk_profile']) != config.data['dingtalk_profile'] and 'dingtalk_conversation' not in data:
                             data['dingtalk_conversation'] = ''
                             data['dingtalk_name'] = ''
+                        if data.get('dingtalk_profile', config.data['dingtalk_profile']) != config.data['dingtalk_profile']:
+                            data['dingtalk_rooms'] = []
                         changed = {k for k, v in data.items() if k in config.data and v != config.data[k] and not (k in ('api_key', 'dingtalk_vision_key') and not v)}
                         if changed & {'dingtalk_profile', 'dingtalk_conversation', 'dingtalk_name'} and data.get('dingtalk_conversation'):
                             from dingtalk import conversations
@@ -154,17 +191,50 @@ def make_server(port=18766, config=None, adapter=None):
                                 raise ValueError('请重新连接钉钉并从会话列表中选择监听对象')
                             data['dingtalk_name'] = matches[0]['name']
                         # Invalidate in-flight replies before replacing configuration.
-                        with engines['wechat'].lock, engines['dingtalk'].lock:
+                        with engines['wechat'].lock, pool.lock, ExitStack() as worker_locks:
+                            workers = [pool.empty, *pool.workers.values()]
+                            for worker in workers:
+                                worker_locks.enter_context(worker.lock)
                             validate({**config.data, **{k:v for k,v in data.items() if k in config.data and not (k in ('api_key', 'dingtalk_vision_key') and not v)}})
-                            for name, worker in engines.items():
-                                if any(not k.startswith(('wechat_', 'dingtalk_')) or k.startswith(name + '_') for k in changed - {'style', 'wechat_reply_latest', 'dingtalk_reply_latest'}):
-                                    worker.stop('设置已更新，请重新开启自动回复')
+                            if 'dingtalk_conversation' in changed and 'dingtalk_rooms' not in data:
+                                data['dingtalk_rooms'] = []
                             result = config.save(data)
+                            if changed & {'dingtalk_profile', 'dingtalk_conversation', 'dingtalk_name'}:
+                                pool.stop('账号或监听对象已变更，请重新开始监听')
+                            for name, targets in [('wechat', [engines['wechat']]), ('dingtalk', workers)]:
+                                if any(not k.startswith(('wechat_', 'dingtalk_')) or k.startswith(name + '_')
+                                       for k in changed - {'wechat_reply_latest', 'dingtalk_reply_latest'}):
+                                    for worker in targets:
+                                        worker.settings_updated()
+                            pool.sync()
                     return self.respond(result)
+                if self.path in ('/api/dingtalk-start-selected', '/api/dingtalk-stop-selected'):
+                    if platform != 'dingtalk':
+                        raise ValueError('批量操作仅支持钉钉')
+                    with settings_lock:
+                        ids = data.get('room_ids', [])
+                        results = (pool.start_all(ids, auto_reply=data.get('auto_reply', False),
+                                                  reply_latest=data.get('reply_latest', False))
+                                   if self.path.endswith('start-selected') else pool.stop_all(ids))
+                    return self.respond({**state_for(platform, cid), 'batch_results': results})
                 if self.path == '/api/start':
                     if not isinstance(data.get('reply_latest', False), bool):
                         raise ValueError('立即回复选项必须是勾选状态')
-                    engine.start(reply_latest=data.get('reply_latest', config.data[platform + '_reply_latest']))
+                    if not isinstance(data.get('auto_reply', True), bool):
+                        raise ValueError('自动回复选项必须是勾选状态')
+                    room = next((r for r in config.data['dingtalk_rooms'] if r['id']==engine.config.data['dingtalk_conversation']), {}) if platform=='dingtalk' else {}
+                    auto_reply = data.get('auto_reply', room.get('auto_reply', True))
+                    reply_latest = data.get('reply_latest', room.get('reply_latest', config.data[platform + '_reply_latest'])) and auto_reply
+                    if platform == 'dingtalk' and room:
+                        with settings_lock, pool.lock:
+                            rooms = [{**r, 'auto_reply':auto_reply,
+                                      'reply_latest':reply_latest}
+                                     if r['id']==room['id'] else r for r in config.data['dingtalk_rooms']]
+                            config.save({'dingtalk_rooms':rooms})
+                            pool.sync()
+                    engine.start(reply_latest=reply_latest, auto_reply=auto_reply)
+                elif self.path in ('/api/send-reply', '/api/discard-reply'):
+                    engine.send_pending(data.get('pending_id'), discard=self.path == '/api/discard-reply')
                 elif self.path == '/api/stop':
                     engine.stop()
                 elif self.path == '/api/test-image':
@@ -173,7 +243,7 @@ def make_server(port=18766, config=None, adapter=None):
                     if data.get('confirm') is not True:
                         raise ValueError('请先确认发送测试图片')
                     if engine.enabled or engine.starting:
-                        raise ValueError('请先暂停自动回复再测试')
+                        raise ValueError('请先暂停监听再测试')
                     from stickers import render
                     from image_sender import send_image
                     from engine import digest
@@ -199,7 +269,7 @@ def make_server(port=18766, config=None, adapter=None):
                         atomic_json(engine.ledger_path, sorted(engine.processed))
                         engine.latest = {'incoming': '图片发送测试', 'reply': '[表情图片] 收到',
                                          'state': '已发送并确认 · 文件传输助手', 'image_path': path}
-                        engine.status = '图片发送测试已确认，自动回复未开启'
+                        engine.status = '图片发送测试已确认，监听未开启'
                         engine.event('测试图片已发送并确认 · 文件传输助手')
                     return self.respond({'message': '测试图片已发送并确认'})
                 elif self.path == '/api/test':
@@ -216,13 +286,17 @@ def make_server(port=18766, config=None, adapter=None):
                         cfg = config.data.copy()
                     if data.get('style') in STYLES:
                         cfg['style'] = data['style']
-                    answer = reply(cfg, [SimpleNamespace(side='them', text=text)])
-                    return self.respond({'reply': answer})
+                    try:
+                        answer = reply(cfg, [SimpleNamespace(side='them', text=text)])
+                    except NeedsReview as error:
+                        answer = review_clarification(text, error)
+                    return self.respond({'reply': str(answer), 'sources': answer.sources,
+                                         'warnings': answer.warnings, 'model': cfg['model']})
                 elif self.path == '/api/permissions':
                     return self.respond({'error': '请在聊天助手 App 中使用原生申请授权按钮'}, 400)
                 else:
                     return self.respond({'error': '接口不存在'}, 404)
-                self.respond(state_for(platform))
+                self.respond(state_for(platform, cid))
             except (ValueError, CloudError) as error:
                 self.respond({'error': str(error)}, 400)
             except Exception:
@@ -262,7 +336,7 @@ if __name__ == '__main__':
             while os.getppid() == parent:
                 time.sleep(0.25)
             for worker in server.engines.values():
-                worker.stop('桌面应用已关闭')
+                worker.stop('桌面应用已关闭', preserve_session=True)
             os._exit(0)
         threading.Thread(target=watch_parent, daemon=True).start()
     print('聊天助手 http://127.0.0.1:18766', flush=True)

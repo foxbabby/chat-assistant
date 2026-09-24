@@ -1,7 +1,7 @@
 [project]
 name = "wechat-chat-assistant"
 version = "1.0.0"
-description = "聊天助手：macOS 微信与钉钉云端智能回复"
+description = "微信聊天助手：云端回复、风格选择与微信自动发送"
 requires-python = ">=3.12"
 dependencies = [
   "pyobjc-framework-applicationservices>=12.2.2",

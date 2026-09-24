@@ -51,7 +51,10 @@ def completion(config, messages, *, probe=False):
 
 
 class NeedsReview(CloudError):
-    """No reliable answer; keep listening instead of sending or globally pausing."""
+    """An answer lacks support; optionally carry a specific missing-information question."""
+    def __init__(self, message, clarification=None):
+        super().__init__(message)
+        self.clarification = clarification
 
 
 class Draft(str):
@@ -83,6 +86,19 @@ def work_query(messages):
     return latest, False
 
 
+def general_knowledge_query(question):
+    """Only a standalone conceptual question may bypass deployment evidence."""
+    text = re.sub(r'\s+', '', question).strip('？?。！!')
+    if re.search(r'现场|我们|我司|本院|这家|这个|该院|版本|配置|编码|单号|多少|几种|原因|报错|失败|异常|不一致|不对|查不到|查不出来|停用|启用|今天|昨天|目前|现在|最新|实际|具体|怎么操作|如何操作', text):
+        return False
+    # No multi-part or operational question can accidentally pass as a definition.
+    if re.search(r'[，,；;。！？!?\n]', text):
+        return False
+    return bool(re.fullmatch(
+        r'(?:请问|请|想了解一下)?(?:什么是.{1,24}|.{1,24}(?:是什么|是什么意思|是干什么的|有什么作用|有什么用途)|'
+        r'(?:介绍|解释)(?:一下|下)?.{1,24}|.{1,24}(?:的定义|的概念))', text))
+
+
 def evidence_answer(raw, evidence, warnings):
     # Accept the common JSON markdown wrapper, never arbitrary surrounding prose.
     fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', raw.strip(), re.S | re.I)
@@ -94,7 +110,15 @@ def evidence_answer(raw, evidence, warnings):
         raise NeedsReview('模型回复格式异常，未发送；继续监听') from None
     if data.get('supported') is False:
         detail = '；' + '；'.join(warnings) if warnings else ''
-        raise NeedsReview('资料不足以支持本次答案' + detail + '；待人工确认，继续监听')
+        clarification = data.get('clarification')
+        missing = data.get('missing_information')
+        if not (isinstance(clarification, str) and 4 <= len(clarification) <= 180
+                and clarification.rstrip().endswith(('？', '?'))
+                and isinstance(missing, list) and missing
+                and all(isinstance(item, str) and item.strip() for item in missing)
+                and not re.search(r'再具体说|再详细说|不确定|补充更多|更多信息', clarification)):
+            clarification = None
+        raise NeedsReview('资料不足以支持本次答案' + detail + '；待人工确认，继续监听', clarification)
     ids = data.get('evidence_ids', [])
     valid_ids = {e['id'] for e in evidence}
     if (data.get('supported') is not True or not isinstance(ids, list) or not ids
@@ -115,7 +139,23 @@ def work_clarification(question, warnings=()):
     return Draft(text, (), ['尚未确认原因，本次仅追问排查信息', *warnings])
 
 
-def reply(config, messages):
+def review_clarification(question, error):
+    reason = str(error).replace('；待人工确认，继续监听', '').replace('，未发送；继续监听', '').replace('；继续监听', '')
+    if getattr(error, 'clarification', None):
+        return Draft(error.clarification, warnings=['本次追问：缺少明确的业务条件', reason])
+    # A format/service failure is not an ambiguity in the user's question.
+    if any(word in reason for word in ('格式', '过长', '身份措辞', '有效的答案依据')):
+        return Draft('这次回复生成失败，暂时没能给出有效答案。', warnings=[reason])
+    draft = work_clarification(question)
+    if draft is None and any(t in question for t in ('拆单', '分单')):
+        draft = Draft('你指的是供应商结账（账入库）的拆单，还是采购、配送等其他单据？')
+    if draft is not None:
+        return Draft(str(draft), warnings=[*draft.warnings, '本次为具体信息追问，未采用未经确认的答案', reason])
+    return Draft('这次没有查到能支持结论的资料，暂时无法核实这个问题的答案。',
+                 warnings=['资料不足，不代表问题不清楚', reason])
+
+
+def reply(config, messages, *, allow_template_clarification=True):
     from knowledge import retrieve
     from config import DATA_DIR
     # Updated independently by the learning task; manual settings remain authoritative.
@@ -131,10 +171,15 @@ def reply(config, messages):
     config = config.copy()
     config['work_knowledge'] = config.get('work_knowledge', '') + '\n' + str(learned.get('knowledge', ''))[:10000]
     question, work_question = work_query(messages)
-    evidence, warnings = retrieve(config, question)
+    general_question = general_knowledge_query(question)
+    if general_question:
+        evidence, warnings = [], ['通用概念解释，未核验现场配置或业务数据']
+        work_question = False
+    else:
+        evidence, warnings = retrieve(config, question)
     if work_question and not evidence:
         clarification = work_clarification(question, warnings)
-        if clarification:
+        if clarification and allow_template_clarification:
             return clarification
         detail = '；' + '；'.join(warnings) if warnings else ''
         raise NeedsReview('未检索到相关工作资料' + detail + '；待人工确认，继续监听')
@@ -152,18 +197,27 @@ def reply(config, messages):
               '\n实际表达示例（仅学语气）：' + json.dumps(learned.get('examples', []), ensure_ascii=False)[:6000] +
               '\n用户维护的表达习惯：' + config.get('voice_profile', '') +
               '\n用户确认的真实表达示例：' + config.get('reply_examples', ''))
+    if general_question:
+        system += ('\n当前是清晰的通用概念问题，直接用可靠的通用知识解释含义和用途；不以未检索到本地资料为由拒答或追问。'
+                   '本助手处于医院物资管理语境，未另行指定领域的 SPD 指 Supply、Processing、Distribution（供应、加工、配送），'
+                   '说明它是医院医用物资供应链管理模式及其信息化支撑，不局限于一款软件。'
+                   '只谈通用概念，不声称现场实现、配置、库存数、最新政策或已核验的事实。')
     if evidence:
         system += '\n工作参考资料（只支持其明确覆盖的结论，本地源码不等于现场版本）：' + json.dumps(evidence, ensure_ascii=False)
         rule_items = [e for e in evidence if e['text'].startswith('规则实现类：')]
-        if rule_items and any(word in question for word in ('哪些','规则','有哪些')):
+        if rule_items and any(word in question for word in ('哪些','规则','有哪些','几种','多少','方式')):
             system += ('\n本次已读取'+str(len(rule_items))+'个独立规则实现。答案必须逐项编号列出这些规则，'
                        '不要合并“自定义分类”和“自定义明细字段”，不要遗漏开关控制的规则；'
                        '按资料注明是否受配置控制，不声称现场全部启用。'
+                       '若问题未指定单据，开头必须说明这是供应商结账（账入库）的规则，不代表整个 SPD；'
                        '列完即结束，只可加一句版本配置说明；不要臆造另一条规则、易混淆规则或未读取的实现。')
     if work_question:
         system += ('\n请仅输出 JSON：{"answer":"可以直接发出的自然回复", "supported":true, "evidence_ids":["1"]}。'
                    'supported 只有资料能明确支持本次具体答案时才为 true，evidence_ids 列出实际支撑答案的资料编号。'
                    '匹配到相同关键词不代表相同问题；案例版本、前提不一致或证据有缺口时 supported=false，answer 留空。'
+                   '仅当问题确实缺少决定答案的业务条件时，另加 missing_information 数组和 clarification 字段，明确询问缺少的单据、入口或条件。'
+                   '例如缺少单据类型就问是采购单还是结账单。禁止笼统说不确定、再具体说一下；用户已给的信息不要重复问。'
+                   '问题清晰但资料不足，不得假装问题有歧义，此时不填 clarification；能由资料回答的内容应直接回答。'
                    '不要把源码路径、资料全文或排查系统内部细节写进 answer。'
                    '询问有哪些规则、支持哪些功能时，回答已提供实现支持的规则清单，不要因尚未核实现场配置就拒答；说明具体生效取决于配置和版本。'
                    '源码可以支持排查方向，但不能证明现场故障原因；以“可以先核对”表述有依据的检查项，不断言现场原因。'
@@ -186,7 +240,7 @@ def reply(config, messages):
         for index in range(len(history_messages)-2, -1, -1):
             if any(term.lower() in history_messages[index].text.lower() for term in TERMS):
                 history_messages = history_messages[index+1:]
-                if len(history_messages) == 1 and re.fullmatch(r'[^，。！？!?\n]{1,12}还是[^，。！？!?\n]{1,12}[？?]?', history_messages[0].text.strip()):
+                if allow_template_clarification and len(history_messages) == 1 and re.fullmatch(r'[^，。！？!?\n]{1,12}还是[^，。！？!?\n]{1,12}[？?]?', history_messages[0].text.strip()):
                     return Draft('你是指哪件事？我确认一下，免得理解错。')
                 system += ('\n当前已转入新话题，不能将旧工作问题套用到本条消息。'
                            '缺少地点、安排或个人行为的事实时简短澄清，不能说自己已去过、看过、查过或决定了某处。')
@@ -200,9 +254,11 @@ def reply(config, messages):
         try:
             answer, used = evidence_answer(answer, evidence, warnings)
         except NeedsReview as error:
+            if allow_template_clarification and error.clarification:
+                return review_clarification(question, error)
             if str(error).startswith('资料不足以支持本次答案'):
                 clarification = work_clarification(question, warnings)
-                if clarification:
+                if clarification and allow_template_clarification:
                     return clarification
             raise
     if re.search(r'(?:我是|作为|身为|就是)(?:一个|一名)?(?:AI|人工智能|机器人|语言模型|(?:微信)?聊天助手)', answer, re.I):

@@ -13,6 +13,28 @@ from test_assistant import FakeWeChat, snap, msg
 from engine import Engine
 
 class VoiceKnowledgeTests(unittest.TestCase):
+    def test_preview_rejects_template_when_no_evidence(self):
+        with patch('knowledge.retrieve', return_value=([], [])), patch('cloud.completion') as generate:
+            with self.assertRaisesRegex(NeedsReview, '未检索到'):
+                reply(DEFAULTS, [msg('SPD库存不对')], allow_template_clarification=False)
+            generate.assert_not_called()
+
+    def test_preview_rejects_unsupported_model_answer(self):
+        evidence = [{'id': '1', 'source': '经验库', 'text': '不相关资料'}]
+        with patch('knowledge.retrieve', return_value=(evidence, [])), patch('cloud.completion', return_value='{"supported":false}'):
+            with self.assertRaisesRegex(NeedsReview, '资料不足'):
+                reply(DEFAULTS, [msg('SPD库存不对')], allow_template_clarification=False)
+
+    def test_preview_preserves_generated_answer_and_sources(self):
+        evidence = [{'id': '1', 'source': '已核对资料', 'text': '库存核对说明'}]
+        raw = json.dumps({'supported': True, 'answer': '可以先核对库存批次。', 'evidence_ids': ['1']})
+        with patch('knowledge.retrieve', return_value=(evidence, ['资料版本提示'])), patch('cloud.completion', return_value=raw) as generate:
+            draft = reply(DEFAULTS, [msg('SPD库存不对')], allow_template_clarification=False)
+            self.assertEqual(draft, '可以先核对库存批次。')
+            self.assertEqual(draft.sources, ['已核对资料'])
+            self.assertEqual(draft.warnings, ['资料版本提示'])
+            generate.assert_called_once()
+
     def test_new_social_topic_does_not_inherit_spd_gate(self):
         for question in ('今天中午去哪吃', '富卓还是楼下'):
             with self.subTest(question=question):
@@ -73,8 +95,8 @@ class VoiceKnowledgeTests(unittest.TestCase):
             cfg=Config(Path(tmp));cfg.save({'voice_profile':'直接说重点','reply_examples':'可以','work_knowledge':'库存案例','spd_knowledge':'disabled'})
             self.assertEqual(Config(Path(tmp)).data['voice_profile'],'直接说重点')
     def test_no_remote_retrieval_for_personal_chat(self):
-        with patch('knowledge.module_evidence') as source:
-            retrieve(DEFAULTS,'今天有点累');source.assert_not_called()
+        with patch('knowledge.run_dws') as remote:
+            retrieve(DEFAULTS,'今天有点累');remote.assert_not_called()
     def test_unrelated_memory_is_not_retrieved(self):
         self.assertEqual(select_passages('私人家庭信息', '库存数据异常'), [])
     def test_needs_review_sends_clarification_and_keeps_listening(self):
@@ -107,3 +129,43 @@ class VoiceKnowledgeTests(unittest.TestCase):
                 self.assertEqual(len(adapter.sent),1)
                 self.assertTrue(engine.enabled)
                 self.assertNotIn('格式异常',str(adapter.sent[0]))
+
+    def test_concept_questions_answer_without_local_evidence_gate(self):
+        from cloud import general_knowledge_query
+        for question in ('spd是什么', 'SPD是什么意思？', '什么是库存', 'SPD是干什么的'):
+            with self.subTest(question=question), patch('knowledge.retrieve') as retrieve_mock, patch('cloud.completion', return_value='SPD 是医院医用物资供应链管理模式。') as generate:
+                self.assertTrue(general_knowledge_query(question))
+                draft = reply(DEFAULTS, [msg(question)])
+                self.assertIn('SPD', draft)
+                self.assertEqual(draft.sources, [])
+                retrieve_mock.assert_not_called()
+                self.assertIn('通用概念问题', generate.call_args.args[1][0]['content'])
+
+    def test_site_and_operational_questions_still_require_evidence(self):
+        from cloud import general_knowledge_query
+        for question in ('我们SPD现在的库存是多少', 'SPD有几种拆单方式', 'SPD库存不对是什么原因',
+                         'SPD当前版本是什么', '请介绍一下本院SPD配置', 'SPD是什么，库存有多少'):
+            self.assertFalse(general_knowledge_query(question), question)
+        with patch('knowledge.retrieve', return_value=([], [])), patch('cloud.completion') as generate:
+            with self.assertRaises(NeedsReview):
+                reply(DEFAULTS, [msg('我们SPD现在的库存是多少')])
+            generate.assert_not_called()
+
+    def test_specific_missing_information_question_is_preserved(self):
+        evidence = [{'id':'1','source':'说明','text':'需要确定业务入口'}]
+        raw = json.dumps({'supported':False,'answer':'','missing_information':['业务入口'],
+                          'clarification':'是在普通新建查询，还是智能补货入口查不到耗材？'})
+        with patch('knowledge.retrieve', return_value=(evidence, [])), patch('cloud.completion', return_value=raw):
+            draft = reply(DEFAULTS, [msg('需求计划耗材查不到')])
+            self.assertIn('普通新建查询', draft)
+            self.assertEqual(draft.sources, [])
+
+    def test_clear_question_and_generation_error_do_not_get_generic_question(self):
+        from cloud import review_clarification
+        clear = review_clarification('本院库存有多少', NeedsReview('资料不足以支持本次答案'))
+        failed = review_clarification('库存不对', NeedsReview('模型回复格式异常'))
+        self.assertIn('无法核实', clear)
+        self.assertNotIn('？', clear)
+        self.assertIn('生成失败', failed)
+        for text in (clear, failed):
+            self.assertNotIn('再具体说一下', text)

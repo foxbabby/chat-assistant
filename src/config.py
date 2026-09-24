@@ -9,10 +9,10 @@ DATA_DIR = Path.home() / 'Library/Application Support/微信聊天助手'
 DEFAULTS = {'base_url': 'https://api.deepseek.com', 'model': 'deepseek-flash',
             'api_key': '', 'style': '自然友好', 'excluded_senders': [], 'self_names': [],
             'voice_profile': '用我的第一人称说话。简短、直接、自然，先说重点，熟人聊天不客套，不使用客服腔。',
-            'reply_examples': '', 'work_knowledge': '', 'spd_knowledge': 'disabled',
+            'reply_examples': '', 'work_knowledge': '', 'spd_knowledge': 'enabled',
             'dingtalk_profile': '', 'dingtalk_conversation': '', 'dingtalk_name': '',
             'dingtalk_image_mode': 'ocr', 'dingtalk_vision_url': '', 'dingtalk_vision_model': '', 'dingtalk_vision_key': '',
-            'dingtalk_interval': 15, 'wechat_reply_latest': False, 'dingtalk_reply_latest': False}
+            'dingtalk_rooms': [], 'dingtalk_interval': 15, 'wechat_reply_latest': False, 'dingtalk_reply_latest': False}
 STYLES = {
     '自然友好': '像熟悉的朋友一样自然、礼貌，简短接住对方的话，不用过度客套。',
     '高情商': '先理解对方的情绪，再温和表达自己的想法，清楚、有分寸。',
@@ -40,8 +40,25 @@ def atomic_json(path, data):
 
 def validate(data):
     list_fields = {'excluded_senders': '无需回复的人员', 'self_names': '我的微信昵称／群昵称'}
-    typed = {'dingtalk_interval', 'wechat_reply_latest', 'dingtalk_reply_latest'}
+    typed = {'dingtalk_rooms', 'dingtalk_interval', 'wechat_reply_latest', 'dingtalk_reply_latest'}
     result = {key: str(data.get(key, value)).strip() for key, value in DEFAULTS.items() if key not in list_fields and key not in typed}
+    rooms = data.get('dingtalk_rooms', [])
+    if not rooms and result['dingtalk_conversation']:
+        rooms = [{'id':result['dingtalk_conversation'], 'name':result['dingtalk_name'] or '钉钉会话'}]
+    if not isinstance(rooms, list) or len(rooms) > 12:
+        raise ValueError('最多同时管理 12 个钉钉会话')
+    clean, seen = [], set()
+    for room in rooms:
+        if not isinstance(room, dict):
+            raise ValueError('会话设置格式不正确')
+        cid, name = room.get('id'), room.get('name')
+        if any(not isinstance(v, str) or not v.strip() or len(v) > 300 or any(c in v for c in '\r\n\x00') for v in (cid, name)) or cid in seen:
+            raise ValueError('会话名称或标识不正确，不能重复添加')
+        if any(not isinstance(room.get(k, False), bool) for k in ('auto_reply', 'reply_latest')):
+            raise ValueError('会话回复选项必须为勾选状态')
+        seen.add(cid)
+        clean.append({'id':cid, 'name':name, 'auto_reply':room.get('auto_reply',False), 'reply_latest':room.get('reply_latest',False)})
+    result['dingtalk_rooms'] = clean
     for key in ('wechat_reply_latest', 'dingtalk_reply_latest'):
         result[key] = data.get(key, False)
         if not isinstance(result[key], bool):

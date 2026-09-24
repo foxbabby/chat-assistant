@@ -85,6 +85,9 @@ def module_evidence(root, question):
     from knowledge import tokens
     root = Path(root)
     route = next((module for aliases, module in ROUTES if any(a in question for a in aliases)), None)
+    implicit_split = not route and any(t in question for t in ('拆单', '拆分单据', '分单'))
+    if implicit_split:
+        route = 'spd/spd-keep-accounts'
     if not route:
         # Fall back to the shared model's Chinese description to discover a domain
         # instead of treating the two original hand-picked modules as all of SPD.
@@ -103,6 +106,8 @@ def module_evidence(root, question):
         return [], []
     module = root / route
     result, warnings = definition_evidence(root, route, question), []
+    if implicit_split:
+        warnings.append('问题未指定单据，本次检索供应商结账/账入库拆单规则；不代表整个 SPD 的全部拆单方式')
     if route.endswith('spd-keep-accounts') and any(t in question for t in ('拆单', '拆分', '分单')):
         files = sorted(module.glob('**/account/rule/impl/EntrySplitRule*.java'))
         if files:
